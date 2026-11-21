@@ -17,6 +17,11 @@ router = APIRouter(prefix="/taxonomy", tags=["分类表"])
 
 
 def _persist_version(db: Session, rows: list[dict], note: str | None) -> dict:
+    """写入新版分类表并标记受影响批次：同一事务提交，要么都生效要么都回滚。
+
+    JSON 与 CSV 上传都走这条路径。过期判定只读取本事务提交前已经生效的
+    发布数据（重发成功会替换明细与版本引用，重发失败则保留上次成功的明细）。
+    """
     old = db.scalar(select(TaxonomyVersion).order_by(
         TaxonomyVersion.version.desc()).limit(1))
     version = create_taxonomy_version(db, rows, note)

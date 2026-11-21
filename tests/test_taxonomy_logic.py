@@ -8,6 +8,7 @@ from app.taxonomy import (
     CYCLE,
     UNKNOWN,
     build_name_index,
+    diff_name_resolution,
     resolve_all,
     resolve_name,
 )
@@ -85,3 +86,62 @@ def test_resolve_all_caches_repeated_names():
     assert len(results) == 3
     assert results[0] is results[1]  # 同一缓存对象
     assert results[2].issue_type == UNKNOWN
+
+
+# ---------------- 版本间差异（过期判定的名称集合） ----------------
+
+def test_diff_detects_direct_and_indirect_renames():
+    old = build_name_index([
+        _row("斑鸠", "Streptopelia chinensis"),
+        _row("Streptopelia chinensis", "Streptopelia chinensis"),
+        _row("喜鹊", "Pica pica"),
+        _row("Pica pica", "Pica pica"),
+    ])
+    new = build_name_index([
+        _row("斑鸠", "Streptopelia chinensis"),                 # 行本身未动
+        _row("Streptopelia chinensis", "Spilopelia chinensis"),  # 链上被改
+        _row("Spilopelia chinensis", "Spilopelia chinensis"),
+        _row("喜鹊", "Pica pica"),
+        _row("Pica pica", "Pica pica"),
+    ])
+    changed = diff_name_resolution(old, new)
+    # 间接改名：斑鸠的最终接受种随链变化，必须被捕获
+    assert changed == {"斑鸠", "streptopelia chinensis"}
+
+
+def test_diff_detects_names_that_became_unparseable():
+    old = build_name_index([
+        _row("麻雀", "Passer montanus"),
+        _row("Passer montanus", "Passer montanus"),
+    ])
+    # 整行删除 → unknown
+    assert diff_name_resolution(old, build_name_index([])) == {
+        "麻雀", "passer montanus"}
+    # 变成同名歧义 → ambiguous
+    new_amb = build_name_index([
+        _row("麻雀", "Passer montanus"),
+        _row("麻雀", "Passer chinensis"),
+    ])
+    assert "麻雀" in diff_name_resolution(old, new_amb)
+    # 变成环路 → cycle
+    new_cyc = build_name_index([
+        _row("麻雀", "Passer montanus"),
+        _row("Passer montanus", "麻雀"),
+    ])
+    assert "麻雀" in diff_name_resolution(old, new_cyc)
+
+
+def test_diff_ignores_unchanged_and_newly_parseable_names():
+    old = build_name_index([_row("喜鹊", "Pica pica")])
+    new = build_name_index([
+        _row("喜鹊", "Pica pica"),
+        _row("麻雀", "Passer montanus"),  # 新增：旧版不可解析 → 不追踪
+    ])
+    assert diff_name_resolution(old, new) == set()
+
+
+def test_diff_uses_normalized_keys():
+    old = build_name_index([_row("Pica Serica", "Pica pica")])
+    new = build_name_index([_row("Pica Serica", "Pica nova")])
+    # 返回的是规范化 key，供库存原始名规范化后匹配
+    assert diff_name_resolution(old, new) == {"pica serica"}

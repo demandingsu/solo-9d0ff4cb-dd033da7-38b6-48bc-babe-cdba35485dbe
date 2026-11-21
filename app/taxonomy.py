@@ -174,14 +174,42 @@ def create_taxonomy_version(
     return version
 
 
+def diff_name_resolution(
+    old_index: NameIndex, new_index: NameIndex
+) -> set[str]:
+    """按现有解析规则，找出最终接受种改变或变得无法解析的名称。
+
+    返回规范化后的名称 key 集合。只比较两版索引中出现过的名称
+    （行名 + 同物异名的并集）：两版都找不到的名称解析结果不变
+    （都是 unknown），无需比较。链式解析使“间接改名”（名称所在行未动、
+    但链上其他行的接受名变化）也会被捕获。
+
+    只收集旧版可解析（accepted_name 非空）的名称：新版下接受名不同
+    或无法解析（unknown/ambiguous/cycle，accepted_name 为 None）都算变化。
+    旧版本就不可解析的名称不会出现在任何已发布明细里，无需追踪。
+    """
+    candidates = sorted(set(old_index.mapping) | set(new_index.mapping))
+    old_results = resolve_all(candidates, old_index)
+    new_results = resolve_all(candidates, new_index)
+    changed: set[str] = set()
+    for key, old_res, new_res in zip(candidates, old_results, new_results):
+        if old_res.accepted_name is None:
+            continue
+        if old_res.accepted_name != new_res.accepted_name:
+            changed.add(key)
+    return changed
+
+
 def mark_affected_batches_stale(
     db: Session, old_version: TaxonomyVersion | None,
     new_version: TaxonomyVersion,
 ) -> list[int]:
     """新分类表发布后，只让解析结果受影响的批次过期。
 
-    判定方式：对比新旧两个版本对“批次已解析记录中出现过的原始名称”
-    的最终接受名，接受名发生变化（或由可解析变为不可解析）才标记 STALE。
+    快速判定：先一次性算出新旧两版之间“最终接受种改变或变得无法解析”
+    的原始名集合（与批次数量无关），再只用这些名称经两次集合查询定位
+    仍引用上一版的批次，而不是逐批读取明细并对每个名称重新解析。
+    只修改批次状态，提交由调用方统一完成（与新版分类表同事务）。
     """
     if old_version is None:
         return []
@@ -190,28 +218,38 @@ def mark_affected_batches_stale(
         TaxonRow.taxonomy_version_id == old_version.id)))
     new_rows = list(db.scalars(select(TaxonRow).where(
         TaxonRow.taxonomy_version_id == new_version.id)))
-    old_index, new_index = build_name_index(old_rows), build_name_index(new_rows)
+    changed_keys = diff_name_resolution(
+        build_name_index(old_rows), build_name_index(new_rows))
+    if not changed_keys:
+        return []
 
-    affected: list[int] = []
-    batches = list(db.scalars(select(SurveyBatch).where(
-        SurveyBatch.published_taxonomy_version_id == old_version.id)))
+    # 仍引用上一版的批次，其发布明细中出现过的原始名（库存原样，去重）
+    stored_names = set(db.scalars(
+        select(ResolvedObservation.raw_species_name)
+        .join(SurveyBatch, SurveyBatch.id == ResolvedObservation.batch_id)
+        .where(SurveyBatch.published_taxonomy_version_id == old_version.id)
+        .distinct()
+    ).all())
+    # 名称匹配大小写/首尾空白不敏感：规范化后与变更集合求交
+    hit_names = {name for name in stored_names if _norm(name) in changed_keys}
+    if not hit_names:
+        return []
+
+    # 只用命中名称定位仍引用上一版的批次（集合查询，而非逐批扫描）
+    batch_ids = sorted(db.scalars(
+        select(ResolvedObservation.batch_id)
+        .join(SurveyBatch, SurveyBatch.id == ResolvedObservation.batch_id)
+        .where(
+            SurveyBatch.published_taxonomy_version_id == old_version.id,
+            ResolvedObservation.raw_species_name.in_(hit_names),
+        )
+        .distinct()
+    ).all())
+    if not batch_ids:
+        return []
+
+    batches = db.scalars(
+        select(SurveyBatch).where(SurveyBatch.id.in_(batch_ids))).all()
     for batch in batches:
-        # 直接查表而非用 batch.resolved 关系集合，避免会话缓存陈旧
-        raw_names = list({
-            row[0]
-            for row in db.execute(
-                select(ResolvedObservation.raw_species_name).where(
-                    ResolvedObservation.batch_id == batch.id)
-            ).all()
-        })
-        changed = False
-        for raw_name in raw_names:
-            old_res = resolve_name(raw_name, old_index)
-            new_res = resolve_name(raw_name, new_index)
-            if old_res.accepted_name != new_res.accepted_name:
-                changed = True
-                break
-        if changed:
-            batch.status = BatchStatus.STALE
-            affected.append(batch.id)
-    return affected
+        batch.status = BatchStatus.STALE
+    return batch_ids
