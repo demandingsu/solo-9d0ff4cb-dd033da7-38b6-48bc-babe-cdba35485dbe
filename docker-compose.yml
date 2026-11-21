@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    container_name: biodiversity-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据库落在挂载卷中，容器重建后数据保留
+      DATABASE_URL: sqlite:////data/biodiversity.db
+      # 首次启动且库为空时写入演示数据；置 0 可关闭
+      SEED_DEMO: "1"
+    volumes:
+      - biodiversity-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  biodiversity-data:
